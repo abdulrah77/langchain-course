@@ -1,0 +1,16 @@
+langchain
+langchain-ollama
+llama-cpp-python
+fastapi
+uvicorn
+pywa
+python-dotenv
+fpdf2
+supabase
+google
+google-genai
+httpx
+apscheduler
+groq
+openai
+assemblyai

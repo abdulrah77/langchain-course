@@ -1,0 +1,242 @@
+WhatsApp Inventory Tool - Features and Access Confirmation
+Generated from current codebase implementation (updated: 2026-05-03 v4 — Production Upgrade).
+
+1) Core Features Implemented
+- Multi-tenant inventory backend via FastAPI routers:
+  - Inventory: list/create/update(admin+)/soft-delete, dashboard stats, consistency check
+  - Products: list/create/update/soft-delete
+  - Suppliers: list/create/update/soft-delete
+  - Invoices: invoice posting flow with payment status, add payment, list payments
+  - Purchases: purchase posting flow, subsequent payments, supplier linkage
+  - Sales Returns: return against invoice, inventory restock, optional refund to ledger
+  - Cash ledger APIs: entries, totals, daily close (RBAC)
+  - Public links: tokenized short-lived read-only inventory/dashboard links
+  - Onboarding: self-service business + first store creation (POST /onboarding/business)
+- WhatsApp webhook ingestion:
+  - GET verification endpoint
+  - POST message ingestion with background processing
+  - Handles text/image/audio webhook messages
+  - Root-path webhook compatibility endpoint also supported
+- AI-assisted media extraction (full cascade fallback):
+  - Vision cascade:  Gemini 1.5 Flash → Groq LLaMA Vision → OpenRouter GPT-4o-mini
+  - Audio cascade:   Groq Whisper → OpenAI Whisper → AssemblyAI
+  - Automatic silent failover on 429 / quota errors — app never goes down due to one provider
+  - Media block is fully MODE-AWARE:
+    - inventory mode  → extracts product name / quantity / price
+    - invoice mode    → extracts items / amounts → discount step → PDF
+    - ledger mode     → extracts entry type / amount from voice note or receipt image
+  - Extraction validation for structured output and core fields
+  - All extractions logged to ai_extractions table (raw + validated JSON)
+- WhatsApp conversation workflow:
+  - First-time phone linking to business/store
+  - Sticky mode switching: inventory / invoice / ledger / sales
+  - Exit mode command: exit, reset, quit, menu → returns to inventory
+  - Mode timeout: auto-reset to inventory after 120 minutes of inactivity
+  - Missing-data follow-up questions
+  - Correction loop before confirmation
+  - YES confirmation path to persist inventory/invoice data
+  - Audio voice notes and images fully supported in all three modes
+- WhatsApp ledger sticky mode:
+  - Switch by sending: ledger
+  - Short commands (no prefix needed): expense / bank deposit / bank withdrawal / total / close
+  - Voice notes and receipt images supported in ledger mode
+  - After EVERY entry, running totals (cash in hand / cash in bank) auto-shown
+- WhatsApp invoice flow (full):
+  - Step 1: Send invoice details as text, voice, or photo
+  - Step 2: Bot shows extracted items
+  - Step 3: Bot asks "Any discount? yes <amount> or no"
+  - Step 4: Bot shows full itemised bill preview
+  - Step 5: YES → invoice posted atomically (stock deducted, ledger updated)
+  - Step 6: PDF bill sent as WhatsApp document
+- WhatsApp old-style ledger prefix commands (still work):
+  - ledger expense / deposit_bank / withdraw_bank / totals / close
+- Public inventory links:
+  - WhatsApp commands: link inventory / link dashboard
+  - Short-lived tokenized public links (token stored as SHA-256 hash)
+  - Public read-only endpoint: GET /public/inventory/{token}
+  - Password protection and strict max_uses enforcement (NEW)
+  - IP access logging per link (NEW)
+- Subscription billing:
+  - Per-store billing at ₹99/store/month
+  - 7-day free trial from store creation
+  - After trial: all WhatsApp commands blocked, Razorpay payment link sent
+  - Razorpay Payment Links API — UPI/card/netbanking
+  - POST /webhooks/razorpay activates subscription on payment
+  - WhatsApp: 3-day reminder, expiry block, payment confirmation
+  - Daily cron (APScheduler, 09:00 IST) scans expiring/expired stores
+- Web app:
+  - Login screen
+  - Dashboard with inventory stats
+  - Inventory list view
+  - Public inventory snapshot page (token route)
+
+2) Data Model Coverage (current)
+- Actively used in code:
+  - businesses, user_businesses, stores (+ store_code, state_code, is_main_store NEW)
+  - products, inventory (+ variant_id NEW — nullable, backward compatible)
+  - product_variants (NEW — attributes JSONB, sku, price per variant)
+  - suppliers
+  - invoices, invoice_items
+  - purchases, purchase_items
+  - sales_returns, sales_return_items
+  - cash_ledger (+ entry_source, reference_type NEW)
+  - cash_balances
+  - inventory_transactions
+  - user_store_access (+ permission matrix columns NEW)
+  - whatsapp_user_links, whatsapp_sessions (+ mode_set_at, mode_timeout_minutes NEW)
+  - whatsapp_user_identities
+  - public_share_links (+ password_hash, ip_access_log, strict_max_uses NEW)
+  - store_subscriptions
+  - ai_extractions (NEW — raw + validated AI extraction JSON per mode)
+  - audit_logs (ACTIVE — triggers on inventory, invoices, cash_ledger, purchases)
+- Not yet fully covered:
+  - product_variants writes from WhatsApp flow (additive — existing product_name flow unchanged)
+  - full employees CRUD
+
+3) Multi-Tenant and Store-Level Isolation (hardened)
+- ALL critical endpoints enforce:
+  - business_id = current authenticated user's business
+  - store_id IN allowed_stores (from user_store_access per user)
+- Dependencies enforced in every router via get_user_context():
+  - Returns: { user_id, business_id, role, allowed_stores, permissions }
+  - permissions: per-store dict of can_manage_inventory, can_manage_ledger,
+    can_view_reports, can_post_invoices, can_manage_purchases
+- Supabase RLS enabled on all operational tables
+- Helper Postgres functions: get_user_business_id(uid), get_user_allowed_stores(uid)
+- Manual stock adjustment routes require role: owner / admin / manager
+
+4) RBAC — Permission Matrix (upgraded)
+- Role column still present: owner, admin, manager, staff
+- New per-store permission columns in user_store_access:
+  - can_manage_inventory   (default: true)
+  - can_manage_ledger      (default: false — staff cannot touch ledger)
+  - can_view_reports       (default: true)
+  - can_post_invoices      (default: true)
+  - can_manage_purchases   (default: false)
+- Back-filled on migration from existing role values
+- FastAPI enforcer: require_permission('can_manage_ledger') etc. in dependencies.py
+- WhatsApp RBAC: can_execute_ledger() still role-based (unchanged, backward compatible)
+
+5) Onboarding (Self-Service — NEW)
+- POST /onboarding/business
+  - Input: business_name, store_name (optional), state_code, plan
+  - Creates business + first store atomically via Postgres RPC
+  - Auto-generates store_code: <SHORT>-<STATE>-<SEQ> (e.g. RT-KL-01)
+  - Links calling user as owner with full permission matrix
+  - Seeds 7-day trial subscription
+  - Blocks if user already owns a business (409)
+- POST /onboarding/store
+  - Adds additional store to existing business
+  - Owner/admin only
+  - Also generates store_code and seeds trial
+
+6) Store Code System (NEW)
+- Format: <BIZ_SHORT>-<STATE_CODE>-<SEQ>  (e.g. SAMS-MH-01, RT-KL-03)
+- BIZ_SHORT: first 3-4 alpha chars of business name, uppercased
+- Sequence: auto-incremented per business (01, 02, ...)
+- Auto-generated by DB trigger on INSERT into stores
+- generate_store_code() Postgres function available
+- Existing stores backfilled on migration
+
+7) Product Variants (NEW — additive)
+- product_variants table: variant_id, product_id, business_id, sku, attributes (JSONB), price
+- inventory.variant_id FK added (nullable — existing rows unaffected)
+- Backward compatible: existing product_name-based WhatsApp flow continues unchanged
+- Forward path: new products can be linked to variants for proper normalization
+- attributes JSONB supports any attribute set: {size, color, material, weight, ...}
+
+8) AI Extractions Table (NEW)
+- ai_extractions: id, business_id, store_id, sender_phone, mode, media_type,
+  raw_response (JSONB), validated_output (JSONB), status, created_at
+- Status flow: pending → confirmed | rejected | error
+- Indexed by (business_id, store_id, created_at) and (sender_phone, created_at)
+- Provides full audit trail of every AI-assisted entry
+
+9) Audit Logging (ACTIVE — NEW)
+- audit_logs table: log_id, table_name, record_id, action, old_data, new_data, changed_at
+- Active triggers on: inventory, invoices, cash_ledger, purchases
+- Captures full before/after row state as JSONB
+- fn_audit_log() trigger function (security definer)
+
+10) Cash Ledger Enhancements (NEW)
+- entry_source column: 'whatsapp' | 'api' | 'system'
+  - Identifies HOW the entry was created — WhatsApp bot vs REST API vs automated
+- reference_type column: 'invoice' | 'purchase' | 'return' | 'manual' | null
+  - Links ledger entry to its originating transaction
+
+11) Public Link Hardening (NEW)
+- password_hash: optional bcrypt hash — public link requires password to view
+- ip_access_log (JSONB array): appended on every access — who/when viewed
+- max_uses: soft limit (existing)
+- strict_max_uses: boolean — hard enforcement via DB trigger (rejects access at limit)
+
+12) Session Mode Improvements (NEW)
+- Exit mode: send "exit", "reset", "quit", "menu" → clears mode, returns to inventory
+- Mode timeout: auto-resets session to inventory after 120 minutes of inactivity
+- mode_set_at column tracks when mode was last changed
+- mode_timeout_minutes column: per-session configurable timeout
+
+13) API Improvements (NEW)
+- Standardized response envelope (utils/response.py):
+  - { success, message, data, request_id }
+- request_id: client-supplied X-Request-ID header OR auto-generated UUID
+- X-Request-ID echoed back in every response header
+- Structured request logging with request_id on every request/response
+
+14) Subscription System
+- Model: per-store, ₹99/month, 7-day free trial
+- table: store_subscriptions
+  - status: trial / active / expired / cancelled
+  - trial_start, trial_end, current_period_start, current_period_end
+  - razorpay_payment_link_id, razorpay_short_url, razorpay_payment_id
+  - reminder_3day_sent_at, expiry_notified_at
+- service: services/subscription_service.py
+  - is_access_allowed(store_id), seed_trial(), activate(), get_or_create_payment_link()
+  - verify_razorpay_webhook() — HMAC-SHA256 verification
+- webhook: POST /webhooks/razorpay (payment_link.paid → activate → WhatsApp confirmation)
+- Enforcement:
+  - WhatsApp: gate in process_webhook_logic (all commands blocked)
+  - REST API: get_user_context() blocks mutation APIs with HTTP 402
+  - verify_store_subscription(store_id) available for per-route explicit check
+
+15) AI Provider Cascade
+- Vision (image → JSON):
+  1. Gemini 1.5 Flash (GEMINI_API_KEY) — primary, 1,500 req/day free
+  2. Groq LLaMA Vision (GROQ_API_KEY) — secondary
+  3. OpenRouter GPT-4o-mini (OPENROUTER_API_KEY) — final fallback
+- Audio (voice note → transcript):
+  1. Groq Whisper (GROQ_API_KEY) — primary, 7,200 req/day free
+  2. OpenAI Whisper (OPENAI_API_KEY) — secondary
+  3. AssemblyAI (ASSEMBLYAI_API_KEY) — final fallback
+
+16) Performance Indexes (NEW)
+- invoices: (business_id, store_id, created_at DESC)
+- purchases: (business_id, store_id, created_at DESC)
+- inventory: (business_id, store_id, product_id) + (variant_id)
+- cash_ledger: (business_id, store_id, created_at DESC)
+- inventory_transactions: (business_id, store_id, occurred_at DESC)
+- sales_returns: (business_id, store_id, created_at DESC)
+- product_variants: (product_id), (business_id)
+- ai_extractions: (business_id, store_id, created_at DESC), (sender_phone, created_at DESC)
+- audit_logs: (table_name, record_id, changed_at DESC)
+
+17) Environment Variables Required
+- Supabase: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+- WhatsApp: WHATSAPP_ACCESS_TOKEN, WHATSAPP_VERIFY_TOKEN, WHATSAPP_PHONE_ID
+- AI Cascade: GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY (optional: OPENAI_API_KEY, ASSEMBLYAI_API_KEY)
+- Razorpay: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
+- Subscription: SUBSCRIPTION_AMOUNT_PAISE (9900), SUBSCRIPTION_PERIOD_DAYS (30)
+- Deployment: APP_BASE_URL (Render URL for Razorpay callback)
+
+18) Recommended Next Steps
+- Run SQL migrations in order:
+  1. 20260501_*.sql (existing)
+  2. 20260503_store_subscriptions.sql
+  3. 20260503_production_upgrade.sql
+- Replace dummy RAZORPAY_* env vars with real test keys
+- Register Razorpay webhook: https://your-api.onrender.com/webhooks/razorpay
+- Seed user_store_access for existing users (or use onboarding flow)
+- Add variant-aware inventory write path to WhatsApp invoice flow (future)
+- Implement OTP verification layer for WhatsApp identity (future)
+- Add Redis caching for dashboard stats (future)
+- Add ₹199 Pro tier with custom PDF branding and multi-admin (future)

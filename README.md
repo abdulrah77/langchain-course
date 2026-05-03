@@ -1,83 +1,118 @@
-# ice_breaker
+# WhatsApp Inventory Tool
 
-A repository for learning LangChain🦜🔗  by building a generative ai application.
+FastAPI + Supabase + React application for inventory management, with WhatsApp webhook ingestion and AI-assisted extraction from image/audio messages.
 
-This is a web application crawling Linkedin & Twitter data about a person and customizes an ice breaker with them.
+## Architecture
 
+- Backend: FastAPI app in `main.py` with routers under `routers/`
+- Data: Supabase tables (`businesses`, `user_businesses`, `products`, `inventory`, etc.)
+- WhatsApp ingestion: `routers/whatsapp.py` + `services/ai_service.py`
+- Inventory domain: `routers/inventory.py` + `services/inventory_service.py`
+- Frontend dashboard: React app in `frontend/`
 
-![Logo](https://github.com/emarco177/ice_breaker/blob/main/static/demo.gif)
-[![udemy](https://img.shields.io/badge/LangChain%20Udemy%20Course-Coupon%20%2412.99-brightgreen)](https://www.udemy.com/course/langchain/?referralCode=JUNE-2025)
+## Environment Setup
 
-## Environment Variables
+Create `ice_breaker/.env` for backend:
 
-To run this project, you will need to add the following environment variables to your .env file
+```env
+NEXT_PUBLIC_SUPABASE_URL=...
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=...
 
-`OPENAI_API_KEY`
+WHATSAPP_VERIFY_TOKEN=...
+WHATSAPP_ACCESS_TOKEN=...
+WHATSAPP_PHONE_ID=...
 
-`SCRAPIN_API_KEY` 
+GEMINI_API_KEY=...
 
-`TAVILY_API_KEY`
+# AI extraction routing (cost optimization)
+AI_ROUTING_MODE=cheap_first
+AI_PROVIDER_PRIORITY=gemini,openrouter
+AI_TIMEOUT_SECONDS=25
+AI_MAX_FALLBACKS=2
+GEMINI_MODEL=gemini-2.5-flash
 
-`TWITTER_API_KEY`
-
-`TWITTER_API_SECRET`
-
-`TWITTER_ACCESS_TOKEN`
-
-`TWITTER_ACCESS_SECRET`
-
-`LANGCHAIN_TRACING_V2`  
-
-`LANGCHAIN_API_KEY` 
-
-`LANGCHAIN_PROJECT` # Optional
-
-
-To run this project, you will need to add the following environment variables to your .env file:
-
-> **Note**: This project uses paid API services:
-> - [Scrapin.io](https://www.scrapin.io/?utm_campaign=influencer&utm_source=github&utm_medium=social&utm_content=edenmarco) for LinkedIn data scraping (20% discount available through this link, includes 20 free credits to start)
-> - Twitter API (paid) for accessing Twitter data
-
-> **Important Note**: If you enable tracing by setting `LANGCHAIN_TRACING_V2=true`, you must have a valid LangSmith API key set in `LANGCHAIN_API_KEY`. Without a valid API key, the application will throw an error. If you don't need tracing, simply remove or comment out these environment variables.
-## Run Locally
-
-Clone the project
-
-```bash
-  git clone https://github.com/emarco177/ice_breaker.git
+# Optional second provider
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openai/gpt-4o-mini
 ```
 
-Go to the project directory
+Create `ice_breaker/frontend/.env` for frontend:
 
-```bash
-  cd ice_breaker
+```env
+VITE_SUPABASE_URL=...
+VITE_SUPABASE_PUBLISHABLE_KEY=...
+VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
-Install dependencies
+Do not store backend secrets in frontend env files.
+
+## Run Backend
 
 ```bash
-  pipenv install
+cd ice_breaker
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
 ```
 
-Start the flask server
+## Run Frontend
 
 ```bash
-  pipenv run app.py
+cd ice_breaker/frontend
+npm install
+npm run dev
 ```
 
+Frontend runs on `http://127.0.0.1:5173` by default.
 
-## Running Tests
+## Core API Routes
 
-To run tests, run the following command
+- `GET /health`
+- `GET /api/inventory/`
+- `POST /api/inventory/`
+- `PUT /api/inventory/{inventory_id}`
+- `DELETE /api/inventory/{inventory_id}`
+- `GET /api/inventory/stats/dashboard`
+- `GET /api/whatsapp/webhook`
+- `POST /api/whatsapp/webhook`
+- `POST /api/invoices/`
+- `POST /api/cash-ledger/entries`
+- `GET /api/cash-ledger/totals/{store_id}`
+- `POST /api/cash-ledger/daily-close`
 
-```bash
-  pipenv run pytest .
-```
+## WhatsApp Flow (High Level)
 
+1. User sends audio/image to WhatsApp.
+2. Webhook receives media event and calls AI extraction.
+3. AI service selects providers/models based on routing mode and priority, then tries them in order.
+4. If core fields are missing, a pending missing-data session is stored and user is asked follow-up questions.
+5. Once data is complete, user receives confirmation preview.
+6. User replies `YES` to persist in Supabase inventory tables.
 
-## 🔗 Links
-[![portfolio](https://img.shields.io/badge/my_portfolio-000?style=for-the-badge&logo=ko-fi&logoColor=white)](https://www.udemy.com/course/langchain/?referralCode=D981B8213164A3EA91AC)
-[![linkedin](https://img.shields.io/badge/linkedin-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/eden-marco/)
-[![twitter](https://img.shields.io/badge/twitter-1DA1F2?style=for-the-badge&logo=twitter&logoColor=white)](https://www.udemy.com/user/eden-marco/)
+### AI Routing Behavior
 
+- `AI_ROUTING_MODE=cheap_first`: starts with lower-cost configured providers, then falls back.
+- `AI_ROUTING_MODE=balanced`: uses default mixed ordering with the same fallback behavior.
+- `AI_ROUTING_MODE=quality_first`: starts with stronger configured providers first.
+- `AI_PROVIDER_PRIORITY`: optional comma-separated override (for example `gemini,openrouter`).
+- `AI_TIMEOUT_SECONDS`: hard timeout per provider attempt.
+- `AI_MAX_FALLBACKS`: max number of fallback attempts after the first provider.
+- Provider/model attempts are validated before acceptance:
+  - output must deserialize into `InventoryExtraction`
+  - core fields (`product_name`, `total_quantity`, `base_price`) must be present unless `missing_core_data=true`
+  - invalid or timed out responses trigger fallback to the next candidate
+
+## Notes
+
+- Current pending WhatsApp session memory is in-process (`pending_sessions` dict). For production, move this to Redis or a durable store.
+- SQL migration for WhatsApp session/link, invoice, and cash-ledger entities is available at `sql/migrations/20260501_whatsapp_invoice_cash_ledger.sql`.
+- Manual validation steps are documented in `QA_WHATSAPP_LEDGER_CHECKLIST.md`.
+
+## Authentication and Tenant Isolation
+
+- Web app login uses Supabase email/password authentication.
+- API access uses Bearer JWT tokens issued by Supabase; backend dependencies validate the token and resolve user context.
+- WhatsApp webhook flow maps sender phone number to a business for identity mapping in that channel; it is not equivalent to a JWT session.
+- Tenant isolation is enforced defensively at two layers:
+  - app-layer service mutations scope update/delete operations by both record ID and authenticated `business_id`
+  - database row-level security (RLS) is still expected as the primary DB guardrail
+- For product, supplier, and inventory mutations, scoped update/delete calls return a safe not-found response when no row is affected.
